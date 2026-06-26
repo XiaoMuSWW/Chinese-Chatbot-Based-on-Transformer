@@ -1,0 +1,265 @@
+import json
+import os
+from collections import Counter
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+from config import Config, PAD_TOKEN, UNK_TOKEN, SOS_TOKEN, EOS_TOKEN, PAD_ID, UNK_ID, SOS_ID, EOS_ID
+
+
+
+#  数据集解析
+
+
+def parse_conv_file(file_path: str) -> list[tuple[str, str]]:
+
+    pairs = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        segment_msgs: list[str] = []
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            if line == "E":
+                # 遇到 E 标记：将当前 segment 中的所有 M 消息配对
+                if segment_msgs:
+                    _extract_pairs(segment_msgs, pairs)
+                    segment_msgs = []
+            elif line.startswith("M "):
+                # 去掉 "M " 前缀，保留分词后的消息
+                msg = line[2:].strip()
+                segment_msgs.append(msg)
+
+        # 处理文件末尾最后一个 segment
+        if segment_msgs:
+            _extract_pairs(segment_msgs, pairs)
+
+    return pairs
+
+
+def _extract_pairs(msgs: list[str], pairs: list[tuple[str, str]]) -> None:
+
+    for i in range(0, len(msgs) - 1, 2):
+        query = msgs[i]
+        response = msgs[i + 1]
+        if query and response:
+            pairs.append((query, response))
+
+
+
+#  词汇表构建
+
+
+def build_vocab(pairs: list[tuple[str, str]], config: Config) -> tuple[dict[str, int], dict[int, str]]:
+
+    counter: Counter[str] = Counter()
+
+    for query, response in pairs:
+        for token in query.split("/"):
+            counter[token] += 1
+        for token in response.split("/"):
+            counter[token] += 1
+
+    print(f"[Vocab] 总 token 种类数: {len(counter)}")
+
+    # 按词频排序，保留 top vocab_size-4（为特殊 token 留位置）
+    most_common = counter.most_common(config.vocab_size - 4)
+
+    token2id: dict[str, int] = {
+        PAD_TOKEN: PAD_ID,
+        UNK_TOKEN: UNK_ID,
+        SOS_TOKEN: SOS_ID,
+        EOS_TOKEN: EOS_ID,
+    }
+
+    for token, freq in most_common:
+        if freq >= config.min_freq:
+            token2id[token] = len(token2id)
+
+    id2token: dict[int, str] = {v: k for k, v in token2id.items()}
+    print(f"[Vocab] 最终词汇表大小: {len(token2id)}")
+    return token2id, id2token
+
+
+def save_vocab(token2id: dict[str, int], id2token: dict[int, str], path: str) -> None:
+    """保存词汇表到 JSON 文件。"""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"token2id": token2id, "id2token": {str(k): v for k, v in id2token.items()}}, f,
+                  ensure_ascii=False, indent=2)
+    print(f"[Vocab] 词汇表已保存至: {path}")
+
+
+def load_vocab(path: str) -> tuple[dict[str, int], dict[int, str]]:
+    """从 JSON 文件加载词汇表。"""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    token2id = data["token2id"]
+    id2token = {int(k): v for k, v in data["id2token"].items()}
+    print(f"[Vocab] 词汇表已加载，大小: {len(token2id)}")
+    return token2id, id2token
+
+
+class ChatDataset(Dataset):
+
+    def __init__(self, pairs: list[tuple[str, str]], token2id: dict[str, int], max_len: int):
+        self.pairs = pairs
+        self.token2id = token2id
+        self.max_len = max_len
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        query, response = self.pairs[idx]
+
+        # Tokenize
+        src_tokens = [self.token2id.get(t, UNK_ID) for t in query.split("/")]
+        tgt_tokens = [self.token2id.get(t, UNK_ID) for t in response.split("/")]
+
+        # 截断
+        src_tokens = src_tokens[:self.max_len]
+        tgt_tokens = tgt_tokens[:self.max_len - 1]  # 为 <SOS>/<EOS> 留空间
+
+        # 转换为 Tensor
+        src = torch.tensor(src_tokens, dtype=torch.long)
+        tgt_input = torch.tensor([SOS_ID] + tgt_tokens, dtype=torch.long)
+        tgt_output = torch.tensor(tgt_tokens + [EOS_ID], dtype=torch.long)
+
+        return {"src": src, "tgt_input": tgt_input, "tgt_output": tgt_output}
+
+
+def collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int = PAD_ID) -> dict[str, torch.Tensor]:
+    """
+    批次整理函数：将不等长序列 padding 到批次内最大长度。
+    """
+    # 按 src 长度降序排列（便于后续处理）
+    batch = sorted(batch, key=lambda x: len(x["src"]), reverse=True)
+
+    src_list, tgt_input_list, tgt_output_list = [], [], []
+    for item in batch:
+        src_list.append(item["src"])
+        tgt_input_list.append(item["tgt_input"])
+        tgt_output_list.append(item["tgt_output"])
+
+    # Padding
+    src_padded = torch.nn.utils.rnn.pad_sequence(src_list, batch_first=True, padding_value=pad_id)
+    tgt_input_padded = torch.nn.utils.rnn.pad_sequence(tgt_input_list, batch_first=True, padding_value=pad_id)
+    tgt_output_padded = torch.nn.utils.rnn.pad_sequence(tgt_output_list, batch_first=True, padding_value=pad_id)
+
+    # Padding mask: True 表示 padding 位置
+    src_mask = (src_padded == pad_id)         # (B, src_len)
+    tgt_pad_mask = (tgt_input_padded == pad_id)  # (B, tgt_len)
+
+    return {
+        "src": src_padded,                    # (B, src_len)
+        "tgt_input": tgt_input_padded,        # (B, tgt_len)
+        "tgt_output": tgt_output_padded,      # (B, tgt_len)
+        "src_mask": src_mask,                 # (B, src_len) — True = padding
+        "tgt_pad_mask": tgt_pad_mask,         # (B, tgt_len) — True = padding
+    }
+
+
+
+#  DataLoader 构建
+
+
+def create_dataloaders(
+    pairs: list[tuple[str, str]],
+    token2id: dict[str, int],
+    config: Config,
+    train_ratio: float = 0.95,
+):
+    """
+    划分训练集 / 验证集，创建 DataLoader。
+    返回: (train_loader, val_loader)
+    """
+    split = int(len(pairs) * train_ratio)
+    train_pairs = pairs[:split]
+    val_pairs = pairs[split:]
+
+    print(f"[Data] 训练集: {len(train_pairs)} 对, 验证集: {len(val_pairs)} 对")
+
+    train_dataset = ChatDataset(train_pairs, token2id, config.max_len)
+    val_dataset = ChatDataset(val_pairs, token2id, config.max_len)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,       # Windows 下多进程可能导致问题，保守设 0
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader
+
+
+
+#  一键预处理入口
+
+
+def prepare_data(config: Config):
+    """
+    一键完成数据预处理：解析文件 → 构建词汇表 → 保存词汇表 → 创建 DataLoader。
+    返回: (train_loader, val_loader, token2id, id2token)
+    """
+    print("=" * 60)
+    print("数据预处理开始")
+    print("=" * 60)
+
+    # 1. 解析对话文件
+    print(f"[Data] 解析文件: {config.data_path}")
+    pairs = parse_conv_file(config.data_path)
+    print(f"[Data] 共提取 {len(pairs)} 个对话对")
+
+    # 2. 构建 / 加载词汇表
+    if os.path.exists(config.vocab_path):
+        token2id, id2token = load_vocab(config.vocab_path)
+    else:
+        token2id, id2token = build_vocab(pairs, config)
+        save_vocab(token2id, id2token, config.vocab_path)
+
+    # 3. 创建 DataLoader
+    train_loader, val_loader = create_dataloaders(pairs, token2id, config)
+
+    print("=" * 60)
+    print("数据预处理完成")
+    print("=" * 60)
+    return train_loader, val_loader, token2id, id2token
+
+
+
+#  直接运行测试
+
+
+if __name__ == "__main__":
+    config = Config()
+    train_loader, val_loader, token2id, id2token = prepare_data(config)
+
+    # 打印一个批次检验
+    batch = next(iter(train_loader))
+    print("\n--- 批次形状验证 ---")
+    print(f"src:        {batch['src'].shape}")          # (B, src_len)
+    print(f"tgt_input:  {batch['tgt_input'].shape}")    # (B, tgt_len)
+    print(f"tgt_output: {batch['tgt_output'].shape}")   # (B, tgt_len)
+    print(f"src_mask:   {batch['src_mask'].shape}")     # (B, src_len)
+    print(f"tgt_mask:   {batch['tgt_mask'].shape}")     # (B, tgt_len, tgt_len)
+
+    # 解码一个样本查看
+    print("\n--- 样本解码 ---")
+    sample_src_ids = batch["src"][0].tolist()
+    sample_tgt_ids = batch["tgt_output"][0].tolist()
+    src_text = "".join(id2token.get(i, "<UNK>") for i in sample_src_ids if i != PAD_ID)
+    tgt_text = "".join(id2token.get(i, "<UNK>") for i in sample_tgt_ids if i not in (PAD_ID, EOS_ID))
+    print(f"Query:    {src_text}")
+    print(f"Response: {tgt_text}")
